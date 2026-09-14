@@ -15,17 +15,22 @@ Usage:
 """
 
 import sys
+import os
 import re
 import html
+import logging
 import requests
+
+logger = logging.getLogger("link_generator")
 
 BASE_URL = (
     "https://script.google.com/macros/s/"
     "AKfycby2RWaYHWIIVGeN07CczwRnoP7Tjoe5_1ETRhdQKXtCiPXpNCYRPzSVSUSxn0XozerMBw"
     "/exec"
 )
-VENUE = "G4104"
-DISPLAY_URL = f"{BASE_URL}?display=1&v={VENUE}"
+
+# Configurable venue via ATTENDANCE_VENUE environment variable (default: G4104)
+DEFAULT_VENUE = os.getenv("ATTENDANCE_VENUE", "G4104")
 
 # Standard generic User-Agent for cloud environments
 HEADERS = {
@@ -58,29 +63,30 @@ def extract_token_from_html(html_content: str):
     return None
 
 
-def get_attendance_link(venue: str = VENUE, timeout: int = 15):
+def get_attendance_link(venue: str = None, timeout: int = 15):
     """
     Fetches the live rotating token and generates the attendance link.
     Returns:
         (token, link) on success
         (None, None) on failure
     """
-    url = f"{BASE_URL}?display=1&v={venue}"
+    selected_venue = venue or os.getenv("ATTENDANCE_VENUE", DEFAULT_VENUE)
+    url = f"{BASE_URL}?display=1&v={selected_venue}"
     try:
         response = requests.get(url, headers=HEADERS, timeout=timeout)
         response.raise_for_status()
 
         if "too many scripts running simultaneously" in response.text:
-            print("[link_generator] Server temporarily rate-limited.")
+            logger.warning("[link_generator] Server temporarily rate-limited.")
             return None, None
 
         token = extract_token_from_html(response.text)
         if token:
-            link = f"{BASE_URL}?v={venue}&t={token}"
+            link = f"{BASE_URL}?v={selected_venue}&t={token}"
             return token, link
 
     except requests.RequestException as exc:
-        print(f"[link_generator] Network request error: {exc}")
+        logger.error(f"[link_generator] Network request error: {exc}")
 
     return None, None
 

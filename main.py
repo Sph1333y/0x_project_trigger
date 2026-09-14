@@ -1,35 +1,43 @@
 """
-main.py — FastAPI Backend for Attendance System with API Key Security
-======================================================================
-Hosted on AWS EC2 to interface with the Flutter mobile application.
+main.py — FastAPI Backend for Attendance System (ARM64 / IPv6 / EC2)
+====================================================================
+Hosted on AWS EC2 (t4g.small ARM64, Ubuntu Server) to interface with the
+Flutter mobile application.
 
-Features:
-  - Header & Query API Key authentication (`X-API-Key` or `?api_key=...`).
-  - Receives toggle commands from Flutter (flag=1 for ON, flag=0 for OFF).
-  - Updates and reads flag_data.json safely via flag_manager.
-  - Returns exact JSON response: {"flag": 1, "status": "ok"} or {"flag": 0, "status": "ok"}
-  - Fully CORS-enabled for Flutter mobile & web clients.
-  - Option to trigger attendance submission in the background when flag is turned ON.
-
-Endpoints:
-  POST /flag          -> Set flag via JSON body {"flag": 1} or query param ?flag=1
-  GET  /flag          -> Read current flag or set via ?flag=1
-  POST /on            -> Shortcut to turn flag ON (flag=1)
-  POST /off           -> Shortcut to turn flag OFF (flag=0)
-  GET  /status        -> Health check & current status
-  POST /submit        -> Manually trigger attendance pipeline in background
+Key Architectural Guarantees:
+  - Header-only API key authentication (`X-API-Key`) with constant-time comparison.
+  - Fail-fast at startup if ATTENDANCE_API_KEY environment variable is missing.
+  - Strict validation on flag values: ONLY Literal[0, 1] accepted.
+  - Read-only GET /flag and state-mutating POST /flag.
+  - Public health check at GET /health (returns {"status": "ok"}).
+  - Safe root endpoint GET / returning service info without leaking state.
+  - Application-level concurrency guard preventing duplicate Chromium processes.
+  - Conservative CORS policy: allow_methods=["GET", "POST"], allow_headers=["Content-Type", "X-API-Key"].
 """
 
 import os
+import sys
+import secrets
 import logging
-from typing import Optional
-from fastapi import FastAPI, BackgroundTasks, Query, Body, HTTPException, Security, Depends, status
-from fastapi.security import APIKeyHeader, APIKeyQuery
+import threading
+from typing import Optional, Literal
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, BackgroundTasks, Body, HTTPException, Security, Depends, status
+from fastapi.security import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from flag_manager import get_flag, set_flag
 import submit_attendance
+
+# ─── Logging Setup ───────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("attendance_backend")
+
 
 # ─── Load .env file automatically if present ─────────────────────────────────
 def _load_env_file():
@@ -47,62 +55,44 @@ def _load_env_file():
 
 _load_env_file()
 
-# ─── API Key Configuration ───────────────────────────────────────────────────
-# Reads API key from environment variable (or .env). 
-# Fallback is only for local development if not set.
+
+# ─── API Key Configuration (Fail-Fast) ───────────────────────────────────────
 API_KEY_ENV = os.getenv("ATTENDANCE_API_KEY")
-if not API_KEY_ENV:
-    raise RuntimeError("ATTENDANCE_API_KEY is not configured")
-  
+
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
-api_key_query = APIKeyQuery(name="api_key", auto_error=False)
 
 
 def verify_api_key(
     header_key: Optional[str] = Security(api_key_header),
-    query_key: Optional[str] = Security(api_key_query)
-):
+) -> str:
     """
-    Validates API key provided in either:
-      1. HTTP Header: 'X-API-Key: <your_key>'
-      2. URL Query Param: '?api_key=<your_key>'
+    Validates API key strictly from the 'X-API-Key' HTTP Header using
+    constant-time string comparison (secrets.compare_digest).
+    Query-parameter authentication is intentionally NOT supported.
     """
-    key = header_key or query_key
-    if not key or key != API_KEY_ENV:
+    if not API_KEY_ENV:
+        logger.critical("ATTENDANCE_API_KEY environment variable is not configured on the server.")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Server authentication configuration error."
+        )
+
+    if not header_key or not secrets.compare_digest(header_key, API_KEY_ENV):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or missing API Key. Provide 'X-API-Key' header or '?api_key=' parameter."
+            detail="Invalid or missing API Key. Provide 'X-API-Key' header."
         )
-    return key
+    return header_key
 
 
-# ─── Logging Setup ───────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-)
-logger = logging.getLogger("attendance_backend")
-
-# ─── FastAPI App Initialization ──────────────────────────────────────────────
-app = FastAPI(
-    title="Attendance System Backend",
-    description="Backend service running on AWS EC2 connecting Flutter to attendance automation.",
-    version="1.0.0"
-)
-
-# Enable CORS for Flutter mobile/web connections
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ─── Application Concurrency Guard ───────────────────────────────────────────
+# Prevents simultaneous browser launches to protect 2 GiB RAM on t4g.small EC2.
+_submission_lock = threading.Lock()
 
 
 # ─── Request & Response Models ───────────────────────────────────────────────
 class FlagRequest(BaseModel):
-    flag: int = Field(..., description="1 for ON, 0 for OFF")
+    flag: Literal[0, 1] = Field(..., description="Flag value must strictly be 0 (OFF) or 1 (ON)")
     student_id: Optional[str] = Field("test123", description="Student ID to submit if triggering attendance")
     auto_trigger: Optional[bool] = Field(False, description="Automatically trigger attendance in background if flag=1")
 
@@ -117,118 +107,130 @@ class FlagRequest(BaseModel):
 
 
 class FlagResponse(BaseModel):
-    flag: int
+    flag: Literal[0, 1]
+    status: str
+
+
+class HealthResponse(BaseModel):
+    status: str
+
+
+class RootResponse(BaseModel):
+    service: str
     status: str
 
 
 # ─── Background Worker ───────────────────────────────────────────────────────
 def background_submit_task(student_id: str):
-    """Executes the attendance pipeline in the background."""
-    logger.info(f"[Background Task] Triggering attendance submission for student: {student_id}")
+    """Executes the attendance pipeline in the background with concurrency protection."""
+    acquired = _submission_lock.acquire(blocking=False)
+    if not acquired:
+        logger.warning(f"[Background Task] Another attendance submission is already running. Skipping duplicate task for student: {student_id}")
+        return
+
     try:
+        logger.info(f"[Background Task] Starting attendance submission for student: {student_id}")
         success, status_code, data = submit_attendance.run_pipeline(student_id=student_id)
-        logger.info(f"[Background Task] Completed with status: {status_code}, success: {success}")
+        logger.info(f"[Background Task] Finished with status: {status_code}, success: {success}")
     except Exception as e:
-        logger.error(f"[Background Task] Error during execution: {e}")
+        logger.error(f"[Background Task] Unexpected error during execution: {e}")
+    finally:
+        _submission_lock.release()
+
+
+# ─── FastAPI Lifespan (Startup Validation) ───────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Validate critical environment at startup
+    if not API_KEY_ENV or not API_KEY_ENV.strip():
+        logger.critical("FATAL: ATTENDANCE_API_KEY environment variable is missing or empty! Server cannot start securely.")
+        raise RuntimeError("ATTENDANCE_API_KEY environment variable must be set.")
+    logger.info("ATTENDANCE_API_KEY is verified and loaded successfully.")
+    yield
+
+
+# ─── FastAPI App Initialization ──────────────────────────────────────────────
+app = FastAPI(
+    title="Attendance System Backend",
+    description="Backend service running on AWS EC2 ARM64 connecting Flutter to attendance automation.",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# Conservative CORS policy for native mobile clients & protected environments
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type", "X-API-Key"],
+)
 
 
 # ─── API Endpoints ───────────────────────────────────────────────────────────
 
-@app.get("/", tags=["Health"])
+@app.get("/", response_model=RootResponse, tags=["Health"])
 def root():
-    """Public root endpoint (health check)."""
-    current_flag = get_flag()
-    return {
-        "service": "Attendance Automation Backend",
-        "status": "online",
-        "flag": current_flag,
-        "auth": "API Key required for protected endpoints (/status, /flag, /on, /off, /submit)"
-    }
+    """Public root endpoint. Returns service identification without exposing internal state."""
+    return RootResponse(
+        service="Attendance Automation Backend",
+        status="online"
+    )
+
+
+@app.get("/health", response_model=HealthResponse, tags=["Health"])
+def health():
+    """Simple public health check endpoint."""
+    return HealthResponse(status="ok")
 
 
 @app.get("/status", response_model=FlagResponse, tags=["Flag Management"], dependencies=[Depends(verify_api_key)])
 def get_status():
-    """Returns the current flag status."""
+    """Returns the current flag status (Protected by X-API-Key)."""
+    current_flag = get_flag()
+    return FlagResponse(flag=current_flag, status="ok")
+
+
+@app.get("/flag", response_model=FlagResponse, tags=["Flag Management"], dependencies=[Depends(verify_api_key)])
+def get_flag_endpoint():
+    """
+    Read-only endpoint to get current flag state.
+    State mutation is strictly reserved for POST /flag.
+    """
     current_flag = get_flag()
     return FlagResponse(flag=current_flag, status="ok")
 
 
 @app.post("/flag", response_model=FlagResponse, tags=["Flag Management"], dependencies=[Depends(verify_api_key)])
-def set_flag_post(
-    request: Optional[FlagRequest] = Body(None),
-    flag: Optional[int] = Query(None, description="Flag: 1 for ON, 0 for OFF"),
-    student_id: Optional[str] = Query("test123", description="Student ID"),
-    auto_trigger: Optional[bool] = Query(False, description="Trigger attendance if flag=1"),
-    background_tasks: BackgroundTasks = BackgroundTasks()
+def set_flag_endpoint(
+    request: FlagRequest = Body(...),
+    background_tasks: BackgroundTasks = None
 ):
     """
     Sets the flag to 1 (ON) or 0 (OFF).
-    Accepts JSON body `{"flag": 1}` or query parameter `?flag=1`.
+    Accepts JSON body: `{"flag": 1}` or `{"flag": 0}`.
     Returns: `{"flag": 1, "status": "ok"}`
     """
-    target_flag = None
-    target_student = student_id
-    trigger = auto_trigger
-
-    if request is not None:
-        target_flag = request.flag
-        if request.student_id:
-            target_student = request.student_id
-        if request.auto_trigger is not None:
-            trigger = request.auto_trigger
-    elif flag is not None:
-        target_flag = flag
-
-    if target_flag is None:
-        raise HTTPException(status_code=400, detail="Missing 'flag' parameter (must be 1 or 0)")
-
-    clean_val = 1 if int(target_flag) == 1 else 0
-    saved_val = set_flag(clean_val)
+    saved_val = set_flag(request.flag)
     logger.info(f"[API] Set flag -> {saved_val}")
 
-    if saved_val == 1 and trigger:
-        background_tasks.add_task(background_submit_task, target_student)
+    if saved_val == 1 and request.auto_trigger and background_tasks is not None:
+        background_tasks.add_task(background_submit_task, request.student_id or "test123")
 
     return FlagResponse(flag=saved_val, status="ok")
 
 
-@app.get("/flag", response_model=FlagResponse, tags=["Flag Management"], dependencies=[Depends(verify_api_key)])
-def get_or_set_flag_get(
-    flag: Optional[int] = Query(None, description="Optional: 1 for ON, 0 for OFF"),
-    student_id: Optional[str] = Query("test123"),
-    auto_trigger: Optional[bool] = Query(False),
-    background_tasks: BackgroundTasks = BackgroundTasks()
-):
-    """
-    GET endpoint for Flutter compatibility:
-      - Calling `/flag` returns current flag: `{"flag": 0, "status": "ok"}`
-      - Calling `/flag?flag=1` sets flag to 1 and returns: `{"flag": 1, "status": "ok"}`
-    """
-    if flag is not None:
-        clean_val = 1 if int(flag) == 1 else 0
-        saved_val = set_flag(clean_val)
-        logger.info(f"[API GET] Set flag -> {saved_val}")
-
-        if saved_val == 1 and auto_trigger:
-            background_tasks.add_task(background_submit_task, student_id)
-
-        return FlagResponse(flag=saved_val, status="ok")
-
-    current_flag = get_flag()
-    return FlagResponse(flag=current_flag, status="ok")
-
-
 @app.post("/on", response_model=FlagResponse, tags=["Convenience Shortcuts"], dependencies=[Depends(verify_api_key)])
 def turn_on(
-    student_id: Optional[str] = Query("test123"),
-    auto_trigger: Optional[bool] = Query(False),
-    background_tasks: BackgroundTasks = BackgroundTasks()
+    student_id: Optional[str] = Body(default="test123", embed=True),
+    auto_trigger: Optional[bool] = Body(default=False, embed=True),
+    background_tasks: BackgroundTasks = None
 ):
     """Shortcut endpoint to turn ON (flag=1)."""
     saved_val = set_flag(1)
     logger.info("[API] Turn ON (flag=1)")
-    if auto_trigger:
-        background_tasks.add_task(background_submit_task, student_id)
+    if auto_trigger and background_tasks is not None:
+        background_tasks.add_task(background_submit_task, student_id or "test123")
     return FlagResponse(flag=saved_val, status="ok")
 
 
@@ -242,12 +244,12 @@ def turn_off():
 
 @app.post("/submit", tags=["Attendance Execution"], dependencies=[Depends(verify_api_key)])
 def trigger_submission_now(
-    student_id: str = Query("test123", description="Student ID to submit"),
-    background_tasks: BackgroundTasks = BackgroundTasks()
+    student_id: Optional[str] = Body(default="test123", embed=True),
+    background_tasks: BackgroundTasks = None
 ):
     """
-    Triggers the attendance submission pipeline.
-    Note: The pipeline will immediately abort if flag == 0 in flag_data.json.
+    Manually triggers the attendance submission pipeline in background.
+    Protected by concurrency guard and flag guard (aborts if flag == 0).
     """
     current_flag = get_flag()
     if current_flag != 1:
@@ -257,15 +259,24 @@ def trigger_submission_now(
             "flag": current_flag
         }
 
-    background_tasks.add_task(background_submit_task, student_id)
+    if _submission_lock.locked():
+        return {
+            "status": "busy",
+            "message": "An attendance submission process is currently in progress. Please wait.",
+            "flag": current_flag
+        }
+
+    if background_tasks is not None:
+        background_tasks.add_task(background_submit_task, student_id or "test123")
+
     return {
         "status": "ok",
-        "message": f"Attendance submission initiated in background for {student_id}",
+        "message": f"Attendance submission initiated in background for {student_id or 'test123'}",
         "flag": current_flag
     }
 
 
 if __name__ == "__main__":
     import uvicorn
-    # Bind to 0.0.0.0 so local network, EC2, and Flutter clients can connect
-    uvicorn.run("main:app", host="::", port=8000)
+    # In local testing, bind to :: or 0.0.0.0 port 8000
+    uvicorn.run("main:app", host="::", port=8000, reload=True, workers=1)

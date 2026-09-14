@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==============================================================================
-# start_server.sh — Startup script for AWS EC2 Linux instance
+# start_server.sh — Startup script for AWS EC2 ARM64 Ubuntu instance (IPv6)
 # ==============================================================================
 
 # Exit on error
@@ -15,5 +15,5 @@ if [ -d "venv" ]; then
     source venv/bin/activate
 fi
 
-echo "Starting FastAPI Attendance Server on 0.0.0.0:8000..."
-exec uvicorn main:app --host 0.0.0.0 --port 8000 --workers 2
+echo "Starting FastAPI Attendance Server on [::]:8000..."
+exec uvicorn main:app --host :: --port 8000 --workers 1

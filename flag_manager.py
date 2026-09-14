@@ -5,25 +5,27 @@ Thread-safe and atomic manager for reading and updating flag_data.json.
 
 Guarantees:
   - If flag_data.json does not exist, it initializes with {"flag": 0}.
-  - Safe concurrent read/write access.
+  - Safe concurrent read/write access via threading.Lock.
   - Returns integer flag value (0 or 1).
+  - Validates flag value strictly (only 0 or 1 allowed).
 """
 
 import os
 import json
 import threading
 from datetime import datetime, timezone
+from typing import Literal
 
 FLAG_FILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flag_data.json")
 _lock = threading.Lock()
 
 
-def get_flag() -> int:
+def get_flag() -> Literal[0, 1]:
     """
     Reads the current flag from flag_data.json.
     Returns:
         1 if flag is ON
-        0 if flag is OFF (or on file read error / missing file)
+        0 if flag is OFF (or on file read error / missing file / invalid content)
     """
     with _lock:
         if not os.path.exists(FLAG_FILE_PATH):
@@ -33,22 +35,25 @@ def get_flag() -> int:
         try:
             with open(FLAG_FILE_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                return int(data.get("flag", 0))
-        except (json.JSONDecodeError, OSError, ValueError):
+                val = data.get("flag", 0)
+                return 1 if val == 1 else 0
+        except (json.JSONDecodeError, OSError, ValueError, TypeError):
             return 0
 
 
-def set_flag(value: int) -> int:
+def set_flag(value: Literal[0, 1]) -> Literal[0, 1]:
     """
     Updates flag_data.json with the given flag value (1 or 0).
+    Raises ValueError if value is not 0 or 1.
     Returns:
         The updated flag value (0 or 1).
     """
-    clean_val = 1 if int(value) == 1 else 0
+    if value not in (0, 1):
+        raise ValueError(f"Invalid flag value: {value}. Flag must be strictly 0 or 1.")
 
     with _lock:
         data = {
-            "flag": clean_val,
+            "flag": value,
             "updated_at": datetime.now(timezone.utc).isoformat()
         }
 
@@ -61,8 +66,13 @@ def set_flag(value: int) -> int:
             # Fallback direct write if atomic replace fails
             with open(FLAG_FILE_PATH, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
 
-    return clean_val
+    return value
 
 
 def _initialize_default():

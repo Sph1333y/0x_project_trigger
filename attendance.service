@@ -1,12 +1,12 @@
 [Unit]
-Description=FastAPI Attendance Backend Service
+Description=FastAPI Attendance Backend Service (ARM64 EC2 IPv6)
 After=network.target
 
 [Service]
 Type=simple
 User=ubuntu
 WorkingDirectory=/home/ubuntu/cloud
-ExecStart=/home/ubuntu/cloud/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000 --workers 2
+ExecStart=/home/ubuntu/cloud/venv/bin/uvicorn main:app --host :: --port 8000 --workers 1
 Restart=always
 RestartSec=5
 StandardOutput=journal
