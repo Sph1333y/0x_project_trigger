@@ -50,8 +50,10 @@ _load_env_file()
 # ─── API Key Configuration ───────────────────────────────────────────────────
 # Reads API key from environment variable (or .env). 
 # Fallback is only for local development if not set.
-API_KEY_ENV = os.getenv("ATTENDANCE_API_KEY", "change_this_secret_key_in_production")
-
+API_KEY_ENV = os.getenv("ATTENDANCE_API_KEY")
+if not API_KEY_ENV:
+    raise RuntimeError("ATTENDANCE_API_KEY is not configured")
+  
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 api_key_query = APIKeyQuery(name="api_key", auto_error=False)
 
@@ -266,4 +268,4 @@ def trigger_submission_now(
 if __name__ == "__main__":
     import uvicorn
     # Bind to 0.0.0.0 so local network, EC2, and Flutter clients can connect
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="::", port=8000)
