@@ -1,0 +1,28 @@
+# Environment Variables / Secrets
+.env
+.env.local
+.env.*
+!.env.example
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Virtual Environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Chrome Profile & runtime cache
+chrome_profile/
+*.tmp
+*.log
+
+# Operating system files
+.DS_Store
+Thumbs.db
